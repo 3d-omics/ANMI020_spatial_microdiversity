@@ -1,0 +1,166 @@
+# Structural
+
+```{r load_libraries, comment="", message=FALSE, warning=FALSE}
+library(tidyverse)
+library(vegan)
+library(adespatial)
+library(ade4)
+library(zCompositions)
+library(ape)
+library(spdep)
+library(lmPerm)
+library(tinytable)
+library(ggh4x)
+select <- dplyr::select
+```
+
+```{r load_data, comment="", message=FALSE, warning=FALSE}
+metadata <- read_tsv("data/alpha_div_filtered.tsv") %>% 
+  filter(
+    batch %in% c("MSEB0011"),
+    type_binomial %in% c("positive"),
+    genome_count_filtering30 %in% c("retained"),
+    !is.na(Xcoord))
+
+counts <- read_tsv("data/structural/coverm.tsv.gz") %>% 
+  select(c("Contig",metadata$microsample))
+
+annotations <- read_tsv(list.files("data/structural", pattern = "\\.gff$", full.names = TRUE),comment = "##", col_names = F) %>% 
+    filter(X3 == "CDS") %>%
+    mutate(gene = str_extract(X9, "(?<=ID=)[^;]+")) %>% 
+    select(gene,start=X4,end=X5) %>% 
+    mutate(length=end-start)
+
+annotations_genome <- read_tsv(list.files("data/structural", pattern = "\\.gff$", full.names = TRUE),comment = "##", col_names = F) %>% 
+    filter(X3 == "CDS") %>%
+    mutate(gene = str_extract(X9, "(?<=ID=)[^;]+")) %>% 
+    select(gene,start=X4,end=X5) %>% 
+    mutate(length=end-start) %>% 
+    mutate(genome=substr(gene, 1, 14)) %>% 
+    group_by(genome) %>% 
+    summarise(length=sum(length))
+
+coverage <- read_tsv("data/structural/contigs.covered_bases.tsv") %>% 
+ rename_with(~ str_remove(., " Covered Bases")) %>% 
+ rename(gene = Contig) %>% 
+ select(c("gene",metadata$microsample)) %>%
+ left_join(annotations %>% select(gene, length), by = "gene") %>% 
+ mutate(across(where(is.numeric) & !matches("length"), ~ .x / length)) %>% 
+ select(-length)
+
+gene_detection <- coverage %>%
+  mutate(across(where(is.numeric), ~ if_else(.x < 0.3, 0, 1)))
+
+coverage_genome <- read_tsv("data/structural/contigs.covered_bases.tsv") %>% 
+ rename_with(~ str_remove(., " Covered Bases")) %>% 
+ mutate(Contig=substr(Contig, 1, 14)) %>% 
+ rename(genome = Contig) %>% 
+ group_by(genome) %>% 
+ summarise(across(where(is.numeric), sum, na.rm = TRUE)) %>% 
+ select(c("genome",metadata$microsample)) %>%
+ left_join(annotations_genome, by = "genome") %>% 
+ mutate(across(where(is.numeric) & !matches("length"), ~ .x / length)) %>% 
+ select(-length)
+
+counts_per_kb <- counts %>%
+  rename(gene = Contig) %>% 
+  left_join(annotations, by = "gene") %>%
+  mutate(length_kb = length / 1000) %>%
+  mutate(across(
+    .cols = where(is.numeric) & !c(length, start, end, length_kb), 
+    .fns = ~ .x / length_kb
+  )) %>%
+  select(-c(length, start, end, length_kb))
+
+counts_per_kb[,-1] <- counts_per_kb[,-1] * gene_detection[,-1]
+
+gene_presence <- read_tsv("data/structural/gene_presence_absence.tsv")
+
+gene_presence_long <- gene_presence %>% 
+  pivot_longer(!Gene, names_to="genome",values_to="presence") %>% 
+  rename(gene=Gene) %>% 
+  filter(presence==1)
+```
+
+## All genes
+
+```{r all_genes, comment="", message=FALSE, warning=FALSE}
+counts_per_kb  %>% 
+  pivot_longer(!gene, names_to="microsample",values_to="counts") %>% 
+  mutate(genome=substr(gene, 1, 14)) %>% 
+  group_by(microsample,genome) %>% 
+  summarise(counts=sum(counts)) %>% 
+  group_by(microsample) %>%
+  mutate(proportion = counts / sum(counts)) %>%
+   left_join(metadata %>% select(microsample,cryosection),by="microsample") %>% 
+  mutate(animal=substr(cryosection, 1, 4)) %>% 
+  ggplot(aes(x = microsample, y = proportion, fill = genome)) +
+      geom_bar(stat = "identity") +
+      labs(x = "Microsample", y = "Counts", title = "Stacked Barplot of Counts by Genome and Microsample") +
+  facet_nested(. ~ animal + cryosection, scale="free")+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Unique genes
+
+```{r unique_genes, comment="", message=FALSE, warning=FALSE}
+unique_genes <- gene_presence %>%
+  rowwise() %>%
+  filter(sum(c_across(-Gene)) == 1) %>%
+  ungroup()
+
+unique_genes_long <- unique_genes %>% 
+  pivot_longer(!Gene, names_to="genome",values_to="presence") %>% 
+  filter(presence==1)
+
+unique_genes_long %>% 
+  group_by(genome) %>% 
+  summarise(count=sum(presence))
+
+counts_per_kb_unique <- counts_per_kb %>% 
+  filter(gene %in% unique_genes_long$Gene) %>% 
+  pivot_longer(!gene, names_to="microsample",values_to="counts") %>% 
+  left_join(unique_genes_long, by=join_by("gene"=="Gene"))
+  
+counts_per_kb_unique %>% 
+  group_by(microsample,genome) %>% 
+  summarise(counts=sum(counts)) %>% 
+  ggplot(aes(x=genome,y=microsample,fill=counts)) +
+    geom_tile()
+
+top50sd <- counts_per_kb_unique %>% 
+  group_by(gene) %>% 
+  summarise(sd=sd(counts)) %>% 
+  arrange(-sd) %>%
+  slice_head(n = 50) %>% 
+  pull(gene)
+
+counts_per_kb_unique %>% 
+  #filter(gene %in% top50sd) %>% 
+  group_by(microsample,genome) %>% 
+  summarise(counts=sum(counts)) %>% 
+  left_join(metadata %>% select(microsample,cryosection),by="microsample") %>% 
+  mutate(animal=substr(cryosection, 1, 4)) %>% 
+  ggplot(aes(x = microsample, y = counts, fill = genome)) +
+      geom_bar(stat = "identity") +
+      labs(x = "Microsample", y = "Counts", title = "Stacked Barplot of Counts by Genome and Microsample") +
+  facet_nested(. ~ animal + cryosection, scale="free")+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+counts_per_kb_unique %>% 
+  #filter(gene %in% top50sd) %>% 
+  group_by(microsample,genome) %>% 
+  summarise(counts=sum(counts)) %>% 
+  group_by(microsample) %>%
+  mutate(proportion = counts / sum(counts)) %>%
+   left_join(metadata %>% select(microsample,cryosection),by="microsample") %>% 
+  mutate(animal=substr(cryosection, 1, 4)) %>% 
+  ggplot(aes(x = microsample, y = proportion, fill = genome)) +
+      geom_bar(stat = "identity") +
+      labs(x = "Microsample", y = "Counts", title = "Stacked Barplot of Counts by Genome and Microsample") +
+  facet_nested(. ~ animal + cryosection, scale="free")+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
